@@ -1,0 +1,23 @@
+{
+  "name": "FigmaExporter",
+  "id": "1485687494525374295",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": [
+    "figma",
+    "figjam"
+  ],
+  "permissions": [],
+  "networkAccess": {
+    "allowedDomains": [
+      "ws://localhost:3066"
+    ],
+    "reasoning": "This plugin lets AI assistants (Cursor, VS Code, Claude Code, etc.) connect to a local MCP server for Figma operations",
+    "devAllowedDomains": [
+      "http://localhost:3066",
+      "ws://localhost:3066"
+    ]
+  },
+  "documentAccess": "dynamic-page"
+}

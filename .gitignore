@@ -1,0 +1,5 @@
+node_modules/
+*.log
+exports/
+copilot_temp/
+.env
