@@ -35,7 +35,7 @@ var MCP_SESSION_ID = process.env.FIGMA_EXPORTER_SESSION_ID || `mcp-${uuidv4()}`;
 var relayActive = false;
 server.tool(
   "get_document_info",
-  "Get detailed information about the current Figma document",
+  "List every page and every visible top-level layer in the connected Figma document.",
   {},
   async () => {
     try {
@@ -91,12 +91,89 @@ var nodeFilterOptionsSchema = z.object({
   includeChildren: z.boolean().optional().describe("Include recursive child nodes. Defaults to true."),
   includeVectors: z.boolean().optional().describe("Include VECTOR nodes. Defaults to true."),
   includeText: z.boolean().optional().describe("Include TEXT nodes and characters. Defaults to true."),
-  includeInvisible: z.boolean().optional().describe("Include hidden nodes. Defaults to true."),
+  includeInvisible: z.boolean().optional().describe("Deprecated and ignored. Hidden nodes and hidden ancestor branches are always excluded."),
   includeFills: z.boolean().optional().describe("Include fill/stroke metadata. Defaults to true."),
   includeEffects: z.boolean().optional().describe("Include effect metadata. Defaults to true."),
-  maxDepth: z.number().int().min(0).max(50).optional().describe("Maximum child depth to return."),
+  includeTextSegments: z.boolean().optional().describe("Include mixed-style text runs. Defaults to true."),
+  includeComponentMetadata: z.boolean().optional().describe("Include component, instance, variant, and bound-variable metadata. Defaults to true."),
+  includeReactions: z.boolean().optional().describe("Include prototype reactions. Defaults to false."),
+  maxDepth: z.number().int().min(0).max(1e3).optional().describe("Maximum child depth. Omit to read the complete hierarchy."),
   assetOnly: z.boolean().optional().describe("Return only export/image/vector-like asset nodes and ancestors.")
 }).optional();
+var readScopeSchema = z.enum(["selection", "current_page", "all_pages"]);
+var assetKindSchema = z.enum(["screen", "image", "media", "vector", "slice", "configured", "asset"]);
+server.tool(
+  "get_design_context",
+  "Read implementation-ready design context: visible nodes at every requested hierarchy level, layout, text runs, colors, effects, components, variables, token summaries, screens, and exportable assets. Use scope=all_pages for the complete file.",
+  {
+    scope: readScopeSchema.optional().describe("Read the selection, current page, or every page. Defaults to current_page for speed."),
+    pageIds: z.array(z.string()).optional().describe("Optional page IDs to read. Supplying this loads the document page index first."),
+    options: nodeFilterOptionsSchema
+  },
+  async ({ scope, pageIds, options }) => {
+    try {
+      const result = await sendCommandToFigma("get_design_context", {
+        scope: scope || "current_page",
+        pageIds,
+        options
+      }, 12e4);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error reading design context: ${error instanceof Error ? error.message : String(error)}`
+        }]
+      };
+    }
+  }
+);
+server.tool(
+  "list_design_assets",
+  "Find every visible screen and recognizable export asset across the requested Figma scope. Recognition uses Figma isAsset, image fills, export settings, slices, vector/media types, and top-level screens.",
+  {
+    scope: readScopeSchema.optional().describe("Defaults to all_pages."),
+    pageIds: z.array(z.string()).optional().describe("Optional page IDs to scan."),
+    kinds: z.array(assetKindSchema).optional().describe("Optional asset-kind filter.")
+  },
+  async ({ scope, pageIds, kinds }) => {
+    try {
+      const result = await sendCommandToFigma("list_design_assets", {
+        scope: scope || "all_pages",
+        pageIds,
+        kinds
+      }, 12e4);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error listing design assets: ${error instanceof Error ? error.message : String(error)}`
+        }]
+      };
+    }
+  }
+);
+server.tool(
+  "get_node_css",
+  "Get Figma Inspect CSS for visible nodes. Useful as a web implementation aid; use get_design_context for platform-neutral data such as Compose.",
+  {
+    nodeIds: z.array(z.string()).min(1).max(100).describe("Visible node IDs to inspect.")
+  },
+  async ({ nodeIds }) => {
+    try {
+      const result = await sendCommandToFigma("get_node_css", { nodeIds }, 12e4);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error getting node CSS: ${error instanceof Error ? error.message : String(error)}`
+        }]
+      };
+    }
+  }
+);
 server.tool(
   "read_my_design",
   "Get detailed information about the current selection in Figma, including all node details",
@@ -110,7 +187,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify(filterFigmaNodeResult(result, options))
+            text: JSON.stringify(result)
           }
         ]
       };
@@ -140,7 +217,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify(filterFigmaNode(result, options))
+            text: JSON.stringify(result)
           }
         ]
       };
@@ -156,151 +233,6 @@ server.tool(
     }
   }
 );
-function rgbaToHex(color) {
-  if (!color) return color;
-  if (typeof color === "string") return color;
-  const r = Math.round((color.r ?? 0) * 255);
-  const g = Math.round((color.g ?? 0) * 255);
-  const b = Math.round((color.b ?? 0) * 255);
-  const alpha = color.a === void 0 ? 1 : color.a;
-  const a = Math.round(alpha * 255);
-  return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}${a === 255 ? "" : a.toString(16).padStart(2, "0")}`;
-}
-function normalizeNodeFilterOptions(options = {}) {
-  return {
-    includeChildren: options.includeChildren !== false,
-    includeVectors: options.includeVectors !== false,
-    includeText: options.includeText !== false,
-    includeInvisible: options.includeInvisible !== false,
-    includeFills: options.includeFills !== false,
-    includeEffects: options.includeEffects !== false,
-    maxDepth: typeof options.maxDepth === "number" ? options.maxDepth : 20,
-    assetOnly: options.assetOnly === true
-  };
-}
-function simplifyPaint(paint) {
-  const out = {
-    type: paint.type,
-    visible: paint.visible !== false,
-    opacity: typeof paint.opacity === "number" ? paint.opacity : 1
-  };
-  if (paint.color) out.color = rgbaToHex(paint.color);
-  if (typeof paint.imageRef === "string") out.imageRef = paint.imageRef;
-  if (typeof paint.imageHash === "string") out.imageHash = paint.imageHash;
-  if (paint.scaleMode) out.scaleMode = paint.scaleMode;
-  if (Array.isArray(paint.gradientStops)) {
-    out.gradientStops = paint.gradientStops.map((stop) => ({
-      position: stop.position,
-      color: stop.color ? rgbaToHex(stop.color) : void 0
-    }));
-  }
-  return out;
-}
-function isAssetLikeNode(node) {
-  const width = node.absoluteBoundingBox?.width ?? node.width ?? 0;
-  const height = node.absoluteBoundingBox?.height ?? node.height ?? 0;
-  const name = String(node.name || "").toLowerCase();
-  const hasImageFill = Array.isArray(node.fills) && node.fills.some((fill) => fill.type === "IMAGE" && (fill.imageRef || fill.imageHash));
-  const hasExport = Array.isArray(node.exportSettings) && node.exportSettings.length > 0;
-  const assetName = /illustration|icon|mockup|phone|card|badge|logo|avatar|widget|theme|image|picture|photo|reminder|streak|completed/.test(name);
-  if (width < 2 || height < 2 || width > 2500 || height > 3e3) return false;
-  return node.type === "SLICE" || hasImageFill || hasExport || node.type === "VECTOR" && width <= 1e3 && height <= 1e3 || assetName;
-}
-function filterFigmaNode(node, options = {}, depth = 0) {
-  if (!node) return null;
-  const opts = normalizeNodeFilterOptions(options);
-  if (!opts.includeInvisible && node.visible === false) return null;
-  if (!opts.includeVectors && node.type === "VECTOR") return null;
-  if (!opts.includeText && node.type === "TEXT") return null;
-  const filtered = {
-    id: node.id,
-    name: node.name,
-    type: node.type
-  };
-  if (node.absoluteBoundingBox) {
-    filtered.absoluteBoundingBox = {
-      x: node.absoluteBoundingBox.x,
-      y: node.absoluteBoundingBox.y,
-      width: node.absoluteBoundingBox.width,
-      height: node.absoluteBoundingBox.height
-    };
-  }
-  if (typeof node.width === "number") filtered.width = node.width;
-  if (typeof node.height === "number") filtered.height = node.height;
-  if (opts.includeFills && Array.isArray(node.fills) && node.fills.length > 0) {
-    filtered.fills = node.fills.map(simplifyPaint);
-    filtered.hasImageFill = node.fills.some((fill) => fill.type === "IMAGE" && (fill.imageRef || fill.imageHash));
-  }
-  if (opts.includeFills && Array.isArray(node.strokes) && node.strokes.length > 0) {
-    filtered.strokes = node.strokes.map(simplifyPaint);
-  }
-  if (typeof node.cornerRadius === "number") filtered.cornerRadius = node.cornerRadius;
-  if (opts.includeText && typeof node.characters === "string") filtered.characters = node.characters;
-  if (opts.includeText && node.style) {
-    filtered.style = {
-      fontFamily: node.style.fontFamily,
-      fontStyle: node.style.fontStyle,
-      fontWeight: node.style.fontWeight,
-      fontSize: node.style.fontSize,
-      textAlignHorizontal: node.style.textAlignHorizontal,
-      letterSpacing: node.style.letterSpacing,
-      lineHeightPx: node.style.lineHeightPx,
-      textCase: node.textCase,
-      textDecoration: node.textDecoration
-    };
-  }
-  if (Array.isArray(node.exportSettings) && node.exportSettings.length > 0) {
-    filtered.exportSettings = node.exportSettings.map((setting) => ({
-      format: setting.format,
-      suffix: setting.suffix,
-      constraint: setting.constraint ? {
-        type: setting.constraint.type,
-        value: setting.constraint.value
-      } : void 0
-    }));
-  }
-  if (opts.includeEffects && Array.isArray(node.effects) && node.effects.length > 0) {
-    filtered.effects = node.effects.map((effect) => ({
-      type: effect.type,
-      visible: effect.visible !== false,
-      radius: effect.radius,
-      color: effect.color ? rgbaToHex(effect.color) : void 0,
-      offset: effect.offset,
-      spread: effect.spread
-    }));
-  }
-  if (typeof node.layoutMode === "string" && node.layoutMode !== "NONE") filtered.layoutMode = node.layoutMode;
-  if (typeof node.itemSpacing === "number") filtered.itemSpacing = node.itemSpacing;
-  if (typeof node.paddingLeft === "number") filtered.paddingLeft = node.paddingLeft;
-  if (typeof node.paddingRight === "number") filtered.paddingRight = node.paddingRight;
-  if (typeof node.paddingTop === "number") filtered.paddingTop = node.paddingTop;
-  if (typeof node.paddingBottom === "number") filtered.paddingBottom = node.paddingBottom;
-  if (typeof node.opacity === "number" && node.opacity !== 1) filtered.opacity = node.opacity;
-  if (node.visible === false) filtered.visible = false;
-  if (opts.includeChildren && depth < opts.maxDepth && Array.isArray(node.children)) {
-    filtered.children = node.children.map((child) => filterFigmaNode(child, opts, depth + 1)).filter((child) => child !== null);
-  }
-  if (opts.assetOnly && !isAssetLikeNode(filtered) && (!filtered.children || filtered.children.length === 0)) {
-    return null;
-  }
-  return filtered;
-}
-function filterFigmaNodeResult(result, options = {}) {
-  if (Array.isArray(result)) {
-    return result.map((item) => {
-      if (item && typeof item === "object" && "document" in item) {
-        const document = filterFigmaNode(item.document, options);
-        return document ? { ...item, document } : null;
-      }
-      return filterFigmaNode(item, options);
-    }).filter((item) => item !== null);
-  }
-  if (result && typeof result === "object" && "document" in result) {
-    const document = filterFigmaNode(result.document, options);
-    return document ? { ...result, document } : null;
-  }
-  return filterFigmaNode(result, options);
-}
 server.tool(
   "get_nodes_info",
   "Get detailed information about multiple nodes in Figma",
@@ -320,7 +252,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify(results.map((result) => filterFigmaNode(result.info, options)))
+            text: JSON.stringify(results.map((result) => result.info))
           }
         ]
       };
@@ -763,6 +695,31 @@ server.tool(
     }
   }
 );
+function sanitizeFileSegment(value, fallback = "unnamed") {
+  const sanitized = value.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").replace(/[. ]+$/g, "").trim().slice(0, 100);
+  return sanitized || fallback;
+}
+function resolveExportDirectory(customDirectory) {
+  return path.resolve(customDirectory || process.env.FIGMA_EXPORTER_EXPORT_DIR || path.join(process.cwd(), "exports"));
+}
+function saveBase64Export(imageData, targetPath) {
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  const buffer = Buffer.from(imageData, "base64");
+  fs.writeFileSync(targetPath, buffer);
+  return buffer.length;
+}
+function choosePngExportScale(asset, platform) {
+  if (platform === "android") return 4;
+  const width = Number(asset.width) || 0;
+  const height = Number(asset.height) || 0;
+  const maxDimension = Math.max(width, height);
+  if (maxDimension <= 0) return 2;
+  const desiredScale = maxDimension <= 128 ? 4 : maxDimension <= 768 ? 3 : 2;
+  const dimensionCap = Math.max(1, 4096 / maxDimension);
+  const areaCap = width > 0 && height > 0 ? Math.max(1, Math.sqrt(16e6 / (width * height))) : desiredScale;
+  const cappedScale = Math.min(desiredScale, dimensionCap, areaCap);
+  return Math.max(1, Math.floor(cappedScale * 4) / 4);
+}
 server.tool(
   "export_node_as_image",
   "Export a node as an image from Figma",
@@ -779,17 +736,15 @@ server.tool(
         scale: scale || 1
       });
       const typedResult = result;
-      const exportDir = process.env.FIGMA_EXPORTER_EXPORT_DIR || "/tmp/figma_exports";
+      const exportDir = resolveExportDirectory();
       let savedPath = null;
       if (typedResult.imageData) {
         try {
-          fs.mkdirSync(exportDir, { recursive: true });
           const ext = (format || "PNG").toLowerCase();
           const safeId = nodeId.replace(/[^A-Za-z0-9_-]/g, "_");
           savedPath = path.join(exportDir, `node_${safeId}.${ext}`);
-          const buf = Buffer.from(typedResult.imageData, "base64");
-          fs.writeFileSync(savedPath, buf);
-          logger.info(`Exported node ${nodeId} to ${savedPath} (${buf.length} bytes)`);
+          const byteLength = saveBase64Export(typedResult.imageData, savedPath);
+          logger.info(`Exported node ${nodeId} to ${savedPath} (${byteLength} bytes)`);
         } catch (e) {
           logger.warn(`Failed to save export to disk: ${e instanceof Error ? e.message : String(e)}`);
           savedPath = null;
@@ -814,6 +769,116 @@ server.tool(
             text: `Error exporting node as image: ${error instanceof Error ? error.message : String(error)}`
           }
         ]
+      };
+    }
+  }
+);
+server.tool(
+  "export_design_assets",
+  "Export every visible recognized asset or screen as PNG. Android always exports at 4x; web chooses a clear scale from the source dimensions while capping oversized output.",
+  {
+    scope: readScopeSchema.optional().describe("Defaults to all_pages."),
+    pageIds: z.array(z.string()).optional().describe("Optional page IDs to export from."),
+    nodeIds: z.array(z.string()).optional().describe("Optional subset of recognized asset node IDs."),
+    kinds: z.array(assetKindSchema).optional().describe("Optional asset-kind filter."),
+    platform: z.enum(["android", "web"]).optional().describe("Android exports PNG at 4x. Web selects an adaptive PNG scale. Defaults to web."),
+    outputDirectory: z.string().optional().describe("Local output directory. Defaults to FIGMA_EXPORTER_EXPORT_DIR or ./exports."),
+    concurrency: z.number().int().min(1).max(6).optional().describe("Parallel Figma exports. Defaults to 3.")
+  },
+  async ({ scope, pageIds, nodeIds, kinds, platform, outputDirectory, concurrency }) => {
+    try {
+      const exportPlatform = platform || "web";
+      const listed = await sendCommandToFigma("list_design_assets", {
+        scope: scope || "all_pages",
+        pageIds,
+        kinds
+      }, 12e4);
+      const requestedIds = Array.isArray(nodeIds) ? new Set(nodeIds) : null;
+      const deduplicated = /* @__PURE__ */ new Map();
+      for (const asset of listed.assets || []) {
+        if ((!requestedIds || requestedIds.has(asset.id)) && !deduplicated.has(asset.id)) {
+          deduplicated.set(asset.id, asset);
+        }
+      }
+      const assets = [...deduplicated.values()];
+      const rootDirectory = resolveExportDirectory(outputDirectory);
+      const fileDirectory = path.join(
+        rootDirectory,
+        sanitizeFileSegment(listed.file?.name || "figma-design"),
+        exportPlatform
+      );
+      const exported = [];
+      const failed = [];
+      let nextIndex = 0;
+      const worker = async () => {
+        while (nextIndex < assets.length) {
+          const asset = assets[nextIndex++];
+          const exportScale = choosePngExportScale(asset, exportPlatform);
+          try {
+            const result = await sendCommandToFigma("export_node_as_image", {
+              nodeId: asset.id,
+              format: "PNG",
+              scale: exportScale
+            }, 12e4);
+            if (!result.imageData) throw new Error("Figma returned no image data");
+            const safeId = String(asset.id).replace(/[^A-Za-z0-9_-]/g, "_");
+            const pageDirectory = path.join(fileDirectory, sanitizeFileSegment(asset.pageName || "page"));
+            const targetPath = path.join(
+              pageDirectory,
+              `${sanitizeFileSegment(asset.name || asset.type)}__${safeId}.png`
+            );
+            const byteLength = saveBase64Export(result.imageData, targetPath);
+            exported.push({
+              nodeId: asset.id,
+              name: asset.name,
+              kind: asset.kind,
+              format: "PNG",
+              platform: exportPlatform,
+              scale: exportScale,
+              sourceWidth: asset.width,
+              sourceHeight: asset.height,
+              outputWidth: typeof asset.width === "number" ? Math.round(asset.width * exportScale) : void 0,
+              outputHeight: typeof asset.height === "number" ? Math.round(asset.height * exportScale) : void 0,
+              byteLength,
+              path: targetPath
+            });
+          } catch (error) {
+            failed.push({
+              nodeId: asset.id,
+              name: asset.name,
+              kind: asset.kind,
+              error: error instanceof Error ? error.message : String(error)
+            });
+          }
+        }
+      };
+      await Promise.all(Array.from(
+        { length: Math.min(concurrency || 3, Math.max(assets.length, 1)) },
+        () => worker()
+      ));
+      const missingNodeIds = requestedIds ? [...requestedIds].filter((nodeId) => !deduplicated.has(nodeId)) : [];
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            outputDirectory: fileDirectory,
+            platform: exportPlatform,
+            format: "PNG",
+            recognizedCount: assets.length,
+            exportedCount: exported.length,
+            failedCount: failed.length,
+            missingNodeIds,
+            exported,
+            failed
+          })
+        }]
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error exporting design assets: ${error instanceof Error ? error.message : String(error)}`
+        }]
       };
     }
   }
@@ -2850,6 +2915,7 @@ function setActiveFileForSession(keyword, sessionId = MCP_SESSION_ID) {
 }
 function startRelay(port = RELAY_PORT) {
   const httpServer = http.createServer((req, res) => {
+    const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -2858,8 +2924,7 @@ function startRelay(port = RELAY_PORT) {
       res.end();
       return;
     }
-    if (req.url === "/channels" && req.method === "GET") {
-      const requestUrl = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
+    if (requestUrl.pathname === "/channels" && req.method === "GET") {
       const sessionId = normalizeSessionId(requestUrl.searchParams.get("sessionId"));
       const sessionActiveChannel = getActiveChannelForSession(sessionId);
       const result = [];
@@ -2877,7 +2942,7 @@ function startRelay(port = RELAY_PORT) {
       res.end(JSON.stringify(result));
       return;
     }
-    if (req.url === "/api/command" && req.method === "POST") {
+    if (requestUrl.pathname === "/api/command" && req.method === "POST") {
       let body = "";
       req.on("data", (chunk) => {
         body += chunk.toString();
@@ -2900,7 +2965,7 @@ function startRelay(port = RELAY_PORT) {
       });
       return;
     }
-    if (req.url === "/api/set_active_file" && req.method === "POST") {
+    if (requestUrl.pathname === "/api/set_active_file" && req.method === "POST") {
       let body = "";
       req.on("data", (chunk) => {
         body += chunk.toString();
@@ -3126,8 +3191,15 @@ async function proxyGetConnectedFiles(sessionId = MCP_SESSION_ID) {
   const url = `http://127.0.0.1:${RELAY_PORT}/channels?sessionId=${encodeURIComponent(normalizeSessionId(sessionId))}`;
   try {
     const res = await fetch(url);
-    return await res.json();
-  } catch {
+    const contentType = res.headers.get("content-type") || "";
+    if (!res.ok || !contentType.includes("application/json")) {
+      logger.warn(`Unexpected /channels response: HTTP ${res.status} ${contentType || "unknown content-type"}`);
+      return [];
+    }
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } catch (err) {
+    logger.warn(`Failed to fetch connected files from relay: ${err.message || String(err)}`);
     return [];
   }
 }

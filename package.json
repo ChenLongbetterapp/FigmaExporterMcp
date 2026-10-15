@@ -18,7 +18,8 @@
     "start": "node dist/server.js",
     "build": "tsup",
     "build:watch": "tsup --watch",
-    "dev": "tsup --watch"
+    "dev": "tsup --watch",
+    "test": "node tests/plugin-read.test.cjs && node tests/export-scale.test.cjs"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

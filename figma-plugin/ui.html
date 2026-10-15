@@ -382,6 +382,7 @@
         channel: null,
         fileName: null,
         fileKey: null,
+        pendingAutoConnect: false,
       };
 
       // UI Elements
@@ -532,6 +533,14 @@
             `Connection error: ${error.message || "Unknown error"}`
           );
         }
+      }
+
+      function triggerConnect() {
+        if (state.connected) return;
+        const port = parseInt(portInput.value, 10) || 3066;
+        updateConnectionStatus(false, "Connecting...");
+        connectionStatus.className = "status info";
+        connectToServer(port);
       }
 
       // Disconnect from websocket server
@@ -711,10 +720,7 @@
           connectionStatus.className = "status info";
           disconnectFromServer();
         } else {
-          const port = parseInt(portInput.value, 10) || 3066;
-          updateConnectionStatus(false, "Connecting...");
-          connectionStatus.className = "status info";
-          connectToServer(port);
+          triggerConnect();
         }
       });
 
@@ -799,12 +805,33 @@
             state.fileName = message.fileName || null;
             state.fileKey = message.fileKey || null;
             console.log("File info received:", state.fileName, state.fileKey);
+            if (state.pendingAutoConnect) {
+              state.pendingAutoConnect = false;
+              triggerConnect();
+            }
+            break;
+          case "init-settings":
+            if (message.settings && message.settings.serverPort) {
+              portInput.value = message.settings.serverPort;
+            }
+            if (message.fileName) state.fileName = message.fileName;
+            if (message.fileKey) state.fileKey = message.fileKey;
             break;
           case "connection-status":
             updateConnectionStatus(message.connected, message.message);
             break;
           case "auto-connect":
-            connectButton.click();
+            if (!state.fileName) {
+              state.pendingAutoConnect = true;
+              setTimeout(() => {
+                if (state.pendingAutoConnect) {
+                  state.pendingAutoConnect = false;
+                  triggerConnect();
+                }
+              }, 100);
+            } else {
+              triggerConnect();
+            }
             break;
           case "auto-disconnect":
             connectButton.click();

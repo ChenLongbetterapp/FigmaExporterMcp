@@ -99,7 +99,7 @@ let relayActive = false;  // true when this instance owns the relay
 // Document Info Tool
 server.tool(
   "get_document_info",
-  "Get detailed information about the current Figma document",
+  "List every page and every visible top-level layer in the connected Figma document.",
   {},
   async () => {
     try {
@@ -163,6 +163,9 @@ type FigmaNodeFilterOptions = {
   includeInvisible?: boolean;
   includeFills?: boolean;
   includeEffects?: boolean;
+  includeTextSegments?: boolean;
+  includeComponentMetadata?: boolean;
+  includeReactions?: boolean;
   maxDepth?: number;
   assetOnly?: boolean;
 };
@@ -171,12 +174,93 @@ const nodeFilterOptionsSchema = z.object({
   includeChildren: z.boolean().optional().describe("Include recursive child nodes. Defaults to true."),
   includeVectors: z.boolean().optional().describe("Include VECTOR nodes. Defaults to true."),
   includeText: z.boolean().optional().describe("Include TEXT nodes and characters. Defaults to true."),
-  includeInvisible: z.boolean().optional().describe("Include hidden nodes. Defaults to true."),
+  includeInvisible: z.boolean().optional().describe("Deprecated and ignored. Hidden nodes and hidden ancestor branches are always excluded."),
   includeFills: z.boolean().optional().describe("Include fill/stroke metadata. Defaults to true."),
   includeEffects: z.boolean().optional().describe("Include effect metadata. Defaults to true."),
-  maxDepth: z.number().int().min(0).max(50).optional().describe("Maximum child depth to return."),
+  includeTextSegments: z.boolean().optional().describe("Include mixed-style text runs. Defaults to true."),
+  includeComponentMetadata: z.boolean().optional().describe("Include component, instance, variant, and bound-variable metadata. Defaults to true."),
+  includeReactions: z.boolean().optional().describe("Include prototype reactions. Defaults to false."),
+  maxDepth: z.number().int().min(0).max(1000).optional().describe("Maximum child depth. Omit to read the complete hierarchy."),
   assetOnly: z.boolean().optional().describe("Return only export/image/vector-like asset nodes and ancestors."),
 }).optional();
+
+const readScopeSchema = z.enum(["selection", "current_page", "all_pages"]);
+const assetKindSchema = z.enum(["screen", "image", "media", "vector", "slice", "configured", "asset"]);
+
+server.tool(
+  "get_design_context",
+  "Read implementation-ready design context: visible nodes at every requested hierarchy level, layout, text runs, colors, effects, components, variables, token summaries, screens, and exportable assets. Use scope=all_pages for the complete file.",
+  {
+    scope: readScopeSchema.optional().describe("Read the selection, current page, or every page. Defaults to current_page for speed."),
+    pageIds: z.array(z.string()).optional().describe("Optional page IDs to read. Supplying this loads the document page index first."),
+    options: nodeFilterOptionsSchema,
+  },
+  async ({ scope, pageIds, options }: any) => {
+    try {
+      const result = await sendCommandToFigma("get_design_context", {
+        scope: scope || "current_page",
+        pageIds,
+        options,
+      }, 120000);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error reading design context: ${error instanceof Error ? error.message : String(error)}`,
+        }],
+      };
+    }
+  }
+);
+
+server.tool(
+  "list_design_assets",
+  "Find every visible screen and recognizable export asset across the requested Figma scope. Recognition uses Figma isAsset, image fills, export settings, slices, vector/media types, and top-level screens.",
+  {
+    scope: readScopeSchema.optional().describe("Defaults to all_pages."),
+    pageIds: z.array(z.string()).optional().describe("Optional page IDs to scan."),
+    kinds: z.array(assetKindSchema).optional().describe("Optional asset-kind filter."),
+  },
+  async ({ scope, pageIds, kinds }: any) => {
+    try {
+      const result = await sendCommandToFigma("list_design_assets", {
+        scope: scope || "all_pages",
+        pageIds,
+        kinds,
+      }, 120000);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error listing design assets: ${error instanceof Error ? error.message : String(error)}`,
+        }],
+      };
+    }
+  }
+);
+
+server.tool(
+  "get_node_css",
+  "Get Figma Inspect CSS for visible nodes. Useful as a web implementation aid; use get_design_context for platform-neutral data such as Compose.",
+  {
+    nodeIds: z.array(z.string()).min(1).max(100).describe("Visible node IDs to inspect."),
+  },
+  async ({ nodeIds }: any) => {
+    try {
+      const result = await sendCommandToFigma("get_node_css", { nodeIds }, 120000);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error getting node CSS: ${error instanceof Error ? error.message : String(error)}`,
+        }],
+      };
+    }
+  }
+);
 
 // Read My Design Tool
 server.tool(
@@ -192,7 +276,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify(filterFigmaNodeResult(result, options))
+            text: JSON.stringify(result)
           }
         ]
       };
@@ -225,7 +309,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify(filterFigmaNode(result, options))
+            text: JSON.stringify(result)
           }
         ]
       };
@@ -261,10 +345,13 @@ function normalizeNodeFilterOptions(options: FigmaNodeFilterOptions = {}): Requi
     includeChildren: options.includeChildren !== false,
     includeVectors: options.includeVectors !== false,
     includeText: options.includeText !== false,
-    includeInvisible: options.includeInvisible !== false,
+    includeInvisible: false,
     includeFills: options.includeFills !== false,
     includeEffects: options.includeEffects !== false,
-    maxDepth: typeof options.maxDepth === "number" ? options.maxDepth : 20,
+    includeTextSegments: options.includeTextSegments !== false,
+    includeComponentMetadata: options.includeComponentMetadata !== false,
+    includeReactions: options.includeReactions === true,
+    maxDepth: typeof options.maxDepth === "number" ? options.maxDepth : Number.POSITIVE_INFINITY,
     assetOnly: options.assetOnly === true,
   };
 }
@@ -435,7 +522,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify(results.map((result) => filterFigmaNode(result.info, options)))
+            text: JSON.stringify(results.map((result) => result.info))
           }
         ]
       };
@@ -957,6 +1044,44 @@ server.tool(
   }
 );
 
+function sanitizeFileSegment(value: string, fallback: string = "unnamed"): string {
+  const sanitized = value
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/[. ]+$/g, "")
+    .trim()
+    .slice(0, 100);
+  return sanitized || fallback;
+}
+
+function resolveExportDirectory(customDirectory?: string): string {
+  return path.resolve(customDirectory || process.env.FIGMA_EXPORTER_EXPORT_DIR || path.join(process.cwd(), "exports"));
+}
+
+function saveBase64Export(imageData: string, targetPath: string): number {
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  const buffer = Buffer.from(imageData, "base64");
+  fs.writeFileSync(targetPath, buffer);
+  return buffer.length;
+}
+
+function choosePngExportScale(asset: { width?: number; height?: number }, platform: "android" | "web"): number {
+  if (platform === "android") return 4;
+
+  const width = Number(asset.width) || 0;
+  const height = Number(asset.height) || 0;
+  const maxDimension = Math.max(width, height);
+  if (maxDimension <= 0) return 2;
+
+  // Small web assets need more density; large screenshots are capped to avoid wasteful files.
+  const desiredScale = maxDimension <= 128 ? 4 : maxDimension <= 768 ? 3 : 2;
+  const dimensionCap = Math.max(1, 4096 / maxDimension);
+  const areaCap = width > 0 && height > 0
+    ? Math.max(1, Math.sqrt(16_000_000 / (width * height)))
+    : desiredScale;
+  const cappedScale = Math.min(desiredScale, dimensionCap, areaCap);
+  return Math.max(1, Math.floor(cappedScale * 4) / 4);
+}
+
 // Export Node as Image Tool
 server.tool(
   "export_node_as_image",
@@ -979,17 +1104,15 @@ server.tool(
       const typedResult = result as { imageData: string; mimeType: string };
 
       // Side-effect: also write to disk. Default dir can be overridden with FIGMA_EXPORTER_EXPORT_DIR.
-      const exportDir = process.env.FIGMA_EXPORTER_EXPORT_DIR || "/tmp/figma_exports";
+      const exportDir = resolveExportDirectory();
       let savedPath: string | null = null;
       if (typedResult.imageData) {
         try {
-          fs.mkdirSync(exportDir, { recursive: true });
           const ext = (format || "PNG").toLowerCase();
           const safeId = nodeId.replace(/[^A-Za-z0-9_-]/g, "_");
           savedPath = path.join(exportDir, `node_${safeId}.${ext}`);
-          const buf = Buffer.from(typedResult.imageData, "base64");
-          fs.writeFileSync(savedPath, buf);
-          logger.info(`Exported node ${nodeId} to ${savedPath} (${buf.length} bytes)`);
+          const byteLength = saveBase64Export(typedResult.imageData, savedPath);
+          logger.info(`Exported node ${nodeId} to ${savedPath} (${byteLength} bytes)`);
         } catch (e) {
           logger.warn(`Failed to save export to disk: ${e instanceof Error ? e.message : String(e)}`);
           savedPath = null;
@@ -1016,6 +1139,124 @@ server.tool(
               }`,
           },
         ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "export_design_assets",
+  "Export every visible recognized asset or screen as PNG. Android always exports at 4x; web chooses a clear scale from the source dimensions while capping oversized output.",
+  {
+    scope: readScopeSchema.optional().describe("Defaults to all_pages."),
+    pageIds: z.array(z.string()).optional().describe("Optional page IDs to export from."),
+    nodeIds: z.array(z.string()).optional().describe("Optional subset of recognized asset node IDs."),
+    kinds: z.array(assetKindSchema).optional().describe("Optional asset-kind filter."),
+    platform: z.enum(["android", "web"]).optional().describe("Android exports PNG at 4x. Web selects an adaptive PNG scale. Defaults to web."),
+    outputDirectory: z.string().optional().describe("Local output directory. Defaults to FIGMA_EXPORTER_EXPORT_DIR or ./exports."),
+    concurrency: z.number().int().min(1).max(6).optional().describe("Parallel Figma exports. Defaults to 3."),
+  },
+  async ({ scope, pageIds, nodeIds, kinds, platform, outputDirectory, concurrency }: any) => {
+    try {
+      const exportPlatform: "android" | "web" = platform || "web";
+      const listed = await sendCommandToFigma("list_design_assets", {
+        scope: scope || "all_pages",
+        pageIds,
+        kinds,
+      }, 120000) as { file?: { name?: string }; assets?: any[] };
+
+      const requestedIds = Array.isArray(nodeIds) ? new Set(nodeIds) : null;
+      const deduplicated = new Map<string, any>();
+      for (const asset of listed.assets || []) {
+        if ((!requestedIds || requestedIds.has(asset.id)) && !deduplicated.has(asset.id)) {
+          deduplicated.set(asset.id, asset);
+        }
+      }
+      const assets = [...deduplicated.values()];
+      const rootDirectory = resolveExportDirectory(outputDirectory);
+      const fileDirectory = path.join(
+        rootDirectory,
+        sanitizeFileSegment(listed.file?.name || "figma-design"),
+        exportPlatform
+      );
+      const exported: any[] = [];
+      const failed: any[] = [];
+      let nextIndex = 0;
+
+      const worker = async () => {
+        while (nextIndex < assets.length) {
+          const asset = assets[nextIndex++];
+          const exportScale = choosePngExportScale(asset, exportPlatform);
+          try {
+            const result = await sendCommandToFigma("export_node_as_image", {
+              nodeId: asset.id,
+              format: "PNG",
+              scale: exportScale,
+            }, 120000) as { imageData?: string; mimeType?: string };
+            if (!result.imageData) throw new Error("Figma returned no image data");
+
+            const safeId = String(asset.id).replace(/[^A-Za-z0-9_-]/g, "_");
+            const pageDirectory = path.join(fileDirectory, sanitizeFileSegment(asset.pageName || "page"));
+            const targetPath = path.join(
+              pageDirectory,
+              `${sanitizeFileSegment(asset.name || asset.type)}__${safeId}.png`
+            );
+            const byteLength = saveBase64Export(result.imageData, targetPath);
+            exported.push({
+              nodeId: asset.id,
+              name: asset.name,
+              kind: asset.kind,
+              format: "PNG",
+              platform: exportPlatform,
+              scale: exportScale,
+              sourceWidth: asset.width,
+              sourceHeight: asset.height,
+              outputWidth: typeof asset.width === "number" ? Math.round(asset.width * exportScale) : undefined,
+              outputHeight: typeof asset.height === "number" ? Math.round(asset.height * exportScale) : undefined,
+              byteLength,
+              path: targetPath,
+            });
+          } catch (error) {
+            failed.push({
+              nodeId: asset.id,
+              name: asset.name,
+              kind: asset.kind,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      };
+
+      await Promise.all(Array.from(
+        { length: Math.min(concurrency || 3, Math.max(assets.length, 1)) },
+        () => worker()
+      ));
+
+      const missingNodeIds = requestedIds
+        ? [...requestedIds].filter((nodeId) => !deduplicated.has(nodeId))
+        : [];
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            outputDirectory: fileDirectory,
+            platform: exportPlatform,
+            format: "PNG",
+            recognizedCount: assets.length,
+            exportedCount: exported.length,
+            failedCount: failed.length,
+            missingNodeIds,
+            exported,
+            failed,
+          }),
+        }],
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error exporting design assets: ${error instanceof Error ? error.message : String(error)}`,
+        }],
       };
     }
   }
@@ -3267,8 +3508,12 @@ type FigmaCommand =
   | "get_selection"
   | "get_node_info"
   | "get_nodes_info"
+  | "get_design_context"
+  | "list_design_assets"
+  | "get_node_css"
   | "read_my_design"
   | "create_rectangle"
+  | "import_image"
   | "create_frame"
   | "create_text"
   | "set_fill_color"
@@ -3332,6 +3577,10 @@ type CommandParams = {
   get_selection: Record<string, never>;
   get_node_info: { nodeId: string; options?: FigmaNodeFilterOptions };
   get_nodes_info: { nodeIds: string[]; options?: FigmaNodeFilterOptions };
+  get_design_context: { scope?: "selection" | "current_page" | "all_pages"; pageIds?: string[]; options?: FigmaNodeFilterOptions };
+  list_design_assets: { scope?: "selection" | "current_page" | "all_pages"; pageIds?: string[]; kinds?: string[] };
+  get_node_css: { nodeIds: string[] };
+  read_my_design: { options?: FigmaNodeFilterOptions };
   create_rectangle: {
     x: number;
     y: number;
@@ -3339,6 +3588,16 @@ type CommandParams = {
     height: number;
     name?: string;
     parentId?: string;
+  };
+  import_image: {
+    imageData: string;
+    name?: string;
+    width: number;
+    height: number;
+    x?: number;
+    y?: number;
+    parentId?: string;
+    scaleMode?: "FILL" | "FIT" | "CROP" | "TILE";
   };
   create_frame: {
     x: number;
@@ -3719,6 +3978,8 @@ function setActiveFileForSession(
 
 function startRelay(port: number = RELAY_PORT): Promise<void> {
   const httpServer = http.createServer((req, res) => {
+    const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
+
     // CORS headers
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -3731,8 +3992,7 @@ function startRelay(port: number = RELAY_PORT): Promise<void> {
     }
 
     // GET /channels — list active files (backward compat for external tools)
-    if (req.url === "/channels" && req.method === "GET") {
-      const requestUrl = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
+    if (requestUrl.pathname === "/channels" && req.method === "GET") {
       const sessionId = normalizeSessionId(requestUrl.searchParams.get("sessionId"));
       const sessionActiveChannel = getActiveChannelForSession(sessionId);
       const result: any[] = [];
@@ -3752,7 +4012,7 @@ function startRelay(port: number = RELAY_PORT): Promise<void> {
     }
 
     // POST /api/command — proxy a Figma command from another MCP instance
-    if (req.url === "/api/command" && req.method === "POST") {
+    if (requestUrl.pathname === "/api/command" && req.method === "POST") {
       let body = "";
       req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
       req.on("end", async () => {
@@ -3775,7 +4035,7 @@ function startRelay(port: number = RELAY_PORT): Promise<void> {
     }
 
     // POST /api/set_active_file — switch active file from another instance
-    if (req.url === "/api/set_active_file" && req.method === "POST") {
+    if (requestUrl.pathname === "/api/set_active_file" && req.method === "POST") {
       let body = "";
       req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
       req.on("end", () => {
@@ -4061,8 +4321,15 @@ async function proxyGetConnectedFiles(sessionId: string = MCP_SESSION_ID): Promi
   const url = `http://127.0.0.1:${RELAY_PORT}/channels?sessionId=${encodeURIComponent(normalizeSessionId(sessionId))}`;
   try {
     const res = await fetch(url);
-    return await res.json() as any[];
-  } catch {
+    const contentType = res.headers.get("content-type") || "";
+    if (!res.ok || !contentType.includes("application/json")) {
+      logger.warn(`Unexpected /channels response: HTTP ${res.status} ${contentType || "unknown content-type"}`);
+      return [];
+    }
+    const data = await res.json();
+    return Array.isArray(data) ? data as any[] : [];
+  } catch (err: any) {
+    logger.warn(`Failed to fetch connected files from relay: ${err.message || String(err)}`);
     return [];
   }
 }

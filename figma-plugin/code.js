@@ -6,6 +6,12 @@ const state = {
   serverPort: 3066, // Default port
 };
 
+// Figma can skip hidden branches inside component instances at the API level.
+// This keeps every read/export traversal aligned with the plugin's visible-only contract.
+if ("skipInvisibleInstanceChildren" in figma) {
+  figma.skipInvisibleInstanceChildren = true;
+}
+
 
 // Helper function for progress updates
 function sendProgressUpdate(
@@ -114,6 +120,12 @@ async function handleCommand(command, params) {
   switch (command) {
     case "get_document_info":
       return await getDocumentInfo();
+    case "get_design_context":
+      return await getDesignContext(params || {});
+    case "list_design_assets":
+      return await listDesignAssets(params || {});
+    case "get_node_css":
+      return await getNodeCss(params || {});
     case "get_selection":
       return await getSelection();
     case "get_node_info":
@@ -130,6 +142,8 @@ async function handleCommand(command, params) {
       return await readMyDesign(params && params.options ? params.options : {});
     case "create_rectangle":
       return await createRectangle(params);
+    case "import_image":
+      return await importImage(params);
     case "create_frame":
       return await createFrame(params);
     case "create_text":
@@ -299,42 +313,93 @@ async function handleCommand(command, params) {
 
 // Command implementations
 
+/**
+ * Create a rectangle backed by a local image payload and append it to a frame.
+ * The image bytes travel over the existing local relay as base64 so no cloud
+ * upload or external file URL is required.
+ */
+async function importImage(params) {
+  const {
+    imageData,
+    name = "Image",
+    width,
+    height,
+    x = 0,
+    y = 0,
+    parentId,
+    scaleMode = "FILL",
+  } = params || {};
+  if (!imageData || typeof imageData !== "string") {
+    throw new Error("Missing imageData base64 payload");
+  }
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    throw new Error("Image width and height must be positive numbers");
+  }
+
+  const binary = atob(imageData);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  const image = figma.createImage(bytes);
+  const rect = figma.createRectangle();
+  rect.name = name;
+  rect.resize(width, height);
+  rect.x = x;
+  rect.y = y;
+  rect.fills = [{ type: "IMAGE", imageHash: image.hash, scaleMode }];
+
+  if (parentId) {
+    const parent = await figma.getNodeByIdAsync(parentId);
+    if (!parent || !("appendChild" in parent)) {
+      throw new Error(`Parent node not found or cannot contain children: ${parentId}`);
+    }
+    parent.appendChild(rect);
+  } else {
+    figma.currentPage.appendChild(rect);
+  }
+  return { id: rect.id, name: rect.name, x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+}
+
 async function getDocumentInfo() {
-  await figma.currentPage.loadAsync();
-  const page = figma.currentPage;
+  await figma.loadAllPagesAsync();
+  const pages = figma.root.children;
   return {
-    name: page.name,
-    id: page.id,
-    type: page.type,
-    children: page.children.map((node) => ({
-      id: node.id,
-      name: node.name,
-      type: node.type,
-    })),
+    name: figma.root.name,
+    id: figma.root.id,
+    type: figma.root.type,
+    pageCount: pages.length,
     currentPage: {
-      id: page.id,
-      name: page.name,
-      childCount: page.children.length,
+      id: figma.currentPage.id,
+      name: figma.currentPage.name,
     },
-    pages: [
-      {
+    pages: pages.map((page) => {
+      const children = page.children.filter((node) => isEffectivelyVisible(node));
+      return {
         id: page.id,
         name: page.name,
-        childCount: page.children.length,
-      },
-    ],
+        childCount: children.length,
+        children: children.map((node) => ({
+          id: node.id,
+          name: node.name,
+          type: node.type,
+          width: typeof node.width === "number" ? node.width : undefined,
+          height: typeof node.height === "number" ? node.height : undefined,
+        })),
+      };
+    }),
+    hiddenNodesExcluded: true,
   };
 }
 
 async function getSelection() {
+  const selection = figma.currentPage.selection.filter((node) => isEffectivelyVisible(node));
   return {
-    selectionCount: figma.currentPage.selection.length,
-    selection: figma.currentPage.selection.map((node) => ({
+    selectionCount: selection.length,
+    selection: selection.map((node) => ({
       id: node.id,
       name: node.name,
       type: node.type,
-      visible: node.visible,
     })),
+    hiddenNodesExcluded: true,
   };
 }
 
@@ -363,123 +428,6 @@ function rgbaToHex(color) {
       })
       .join("")
   );
-}
-
-function filterFigmaNode(node) {
-  // 修复：保留 VECTOR 节点（之前直接返回 null 会丢掉所有矢量图形 = 图标/插画全没了）
-  // 资产导出需要看到 VECTOR
-
-  var filtered = {
-    id: node.id,
-    name: node.name,
-    type: node.type,
-  };
-
-  if (node.fills && node.fills.length > 0) {
-    filtered.fills = node.fills.map((fill) => {
-      var processedFill = Object.assign({}, fill);
-      delete processedFill.boundVariables;
-      // 修复：保留 imageRef（用来识别 image fill = 外链图 vs solid fill）
-      // delete processedFill.imageRef;
-
-      if (processedFill.gradientStops) {
-        processedFill.gradientStops = processedFill.gradientStops.map(
-          (stop) => {
-            var processedStop = Object.assign({}, stop);
-            if (processedStop.color) {
-              processedStop.color = rgbaToHex(processedStop.color);
-            }
-            delete processedStop.boundVariables;
-            return processedStop;
-          }
-        );
-      }
-
-      if (processedFill.color) {
-        processedFill.color = rgbaToHex(processedFill.color);
-      }
-
-      return processedFill;
-    });
-  }
-
-  if (node.strokes && node.strokes.length > 0) {
-    filtered.strokes = node.strokes.map((stroke) => {
-      var processedStroke = Object.assign({}, stroke);
-      delete processedStroke.boundVariables;
-      if (processedStroke.color) {
-        processedStroke.color = rgbaToHex(processedStroke.color);
-      }
-      return processedStroke;
-    });
-  }
-
-  if (node.cornerRadius !== undefined) {
-    filtered.cornerRadius = node.cornerRadius;
-  }
-
-  if (node.absoluteBoundingBox) {
-    filtered.absoluteBoundingBox = node.absoluteBoundingBox;
-  }
-
-  if (node.characters) {
-    filtered.characters = node.characters;
-  }
-
-  if (node.style) {
-    filtered.style = {
-      fontFamily: node.style.fontFamily,
-      fontStyle: node.style.fontStyle,
-      fontWeight: node.style.fontWeight,
-      fontSize: node.style.fontSize,
-      textAlignHorizontal: node.style.textAlignHorizontal,
-      letterSpacing: node.style.letterSpacing,
-      lineHeightPx: node.style.lineHeightPx,
-      textCase: node.textCase,
-      textDecoration: node.textDecoration,
-    };
-  }
-
-  // 资产识别所需的额外字段
-  if (Array.isArray(node.exportSettings) && node.exportSettings.length > 0) {
-    filtered.exportSettings = node.exportSettings;
-  }
-  if (node.effects && node.effects.length > 0) {
-    filtered.effects = node.effects;
-  }
-  if (node.layoutMode !== undefined && node.layoutMode !== "NONE") {
-    filtered.layoutMode = node.layoutMode;
-  }
-  if (node.itemSpacing !== undefined) {
-    filtered.itemSpacing = node.itemSpacing;
-  }
-  if (node.paddingLeft !== undefined) filtered.paddingLeft = node.paddingLeft;
-  if (node.paddingRight !== undefined) filtered.paddingRight = node.paddingRight;
-  if (node.paddingTop !== undefined) filtered.paddingTop = node.paddingTop;
-  if (node.paddingBottom !== undefined) filtered.paddingBottom = node.paddingBottom;
-  if (node.opacity !== undefined && node.opacity !== 1) {
-    filtered.opacity = node.opacity;
-  }
-  if (node.visible === false) {
-    filtered.visible = false;
-  }
-  // 标记是否有 image fill（asset 重要标识）
-  if (node.fills && Array.isArray(node.fills)) {
-    var hasImageFill = node.fills.some(function (f) { return f.type === "IMAGE" && f.imageRef; });
-    if (hasImageFill) filtered.hasImageFill = true;
-  }
-
-  if (node.children) {
-    filtered.children = node.children
-      .map(function (child) {
-        return filterFigmaNode(child);
-      })
-      .filter(function (child) {
-        return child !== null;
-      });
-  }
-
-  return filtered;
 }
 
 async function getNodeInfo(nodeId, options = {}) {
@@ -521,12 +469,85 @@ function normalizeReadOptions(options = {}) {
     includeChildren: options.includeChildren !== false,
     includeVectors: options.includeVectors !== false,
     includeText: options.includeText !== false,
-    includeInvisible: options.includeInvisible !== false,
+    includeInvisible: false,
     includeFills: options.includeFills !== false,
     includeEffects: options.includeEffects !== false,
-    maxDepth: typeof options.maxDepth === "number" ? options.maxDepth : 20,
+    includeTextSegments: options.includeTextSegments !== false,
+    includeComponentMetadata: options.includeComponentMetadata !== false,
+    includeReactions: options.includeReactions === true,
+    maxDepth: typeof options.maxDepth === "number" ? options.maxDepth : Number.POSITIVE_INFINITY,
     assetOnly: options.assetOnly === true,
   };
+}
+
+function isEffectivelyVisible(node) {
+  let current = node;
+  while (current && current.type !== "DOCUMENT" && current.type !== "PAGE") {
+    if ("visible" in current && current.visible === false) return false;
+    current = current.parent;
+  }
+  return true;
+}
+
+function toPlainValue(value, depth = 0) {
+  if (value === figma.mixed) return "MIXED";
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "symbol" || typeof value === "function") return undefined;
+  if (depth > 6) return undefined;
+  if (Array.isArray(value)) {
+    return value.map((item) => toPlainValue(item, depth + 1)).filter((item) => item !== undefined);
+  }
+  if (typeof value === "object") {
+    const out = {};
+    for (const key of Object.keys(value)) {
+      const item = toPlainValue(value[key], depth + 1);
+      if (item !== undefined) out[key] = item;
+    }
+    return out;
+  }
+  return undefined;
+}
+
+function readMixedValue(value) {
+  return value === figma.mixed ? "MIXED" : toPlainValue(value);
+}
+
+function simplifyPaintForRead(paint) {
+  const out = {
+    type: paint.type,
+    visible: paint.visible !== false,
+    opacity: typeof paint.opacity === "number" ? paint.opacity : 1,
+  };
+  if (paint.color) out.color = rgbaToHex(paint.color);
+  if (typeof paint.imageHash === "string") out.imageHash = paint.imageHash;
+  if (typeof paint.imageRef === "string") out.imageRef = paint.imageRef;
+  if (paint.scaleMode) out.scaleMode = paint.scaleMode;
+  if (typeof paint.rotation === "number") out.rotation = paint.rotation;
+  if (typeof paint.scalingFactor === "number") out.scalingFactor = paint.scalingFactor;
+  if (paint.filters) out.filters = toPlainValue(paint.filters);
+  if (paint.gradientStops) {
+    out.gradientStops = paint.gradientStops.map((stop) => ({
+      position: stop.position,
+      color: stop.color ? rgbaToHex(stop.color) : undefined,
+    }));
+  }
+  if (paint.gradientTransform) out.gradientTransform = toPlainValue(paint.gradientTransform);
+  if (paint.imageTransform) out.imageTransform = toPlainValue(paint.imageTransform);
+  return out;
+}
+
+function simplifyEffectForRead(effect) {
+  const out = {
+    type: effect.type,
+    visible: effect.visible !== false,
+  };
+  if (typeof effect.radius === "number") out.radius = effect.radius;
+  if (typeof effect.spread === "number") out.spread = effect.spread;
+  if (effect.color) out.color = rgbaToHex(effect.color);
+  if (effect.offset) out.offset = toPlainValue(effect.offset);
+  if (effect.blendMode) out.blendMode = effect.blendMode;
+  return out;
 }
 
 function isAssetLikeReadNode(node) {
@@ -543,16 +564,17 @@ function isAssetLikeReadNode(node) {
   const assetName = /illustration|icon|mockup|phone|card|badge|logo|avatar|widget|theme|image|picture|photo|reminder|streak|completed/.test(name);
 
   if (width < 2 || height < 2 || width > 2500 || height > 3000) return false;
-  return node.type === "SLICE"
+  return node.isAsset === true
+    || node.type === "SLICE"
     || hasImageFill
     || hasExport
-    || (node.type === "VECTOR" && width <= 1000 && height <= 1000)
+    || (["VECTOR", "BOOLEAN_OPERATION", "STAR", "POLYGON"].includes(node.type) && width <= 1000 && height <= 1000)
     || assetName;
 }
 
 function readNodeFull(node, options = {}, depth = 0) {
   if (!node) return null;
-  if (!options.includeInvisible && node.visible === false) return null;
+  if (!isEffectivelyVisible(node)) return null;
   if (!options.includeVectors && node.type === "VECTOR") return null;
   if (!options.includeText && node.type === "TEXT") return null;
 
@@ -562,48 +584,25 @@ function readNodeFull(node, options = {}, depth = 0) {
     type: node.type,
   };
 
-  if (options.includeFills && node.fills && Array.isArray(node.fills) && node.fills.length > 0) {
-    out.fills = node.fills.map((f) => {
-      const cf = {
-        type: f.type,
-        visible: f.visible !== false,
-        opacity: typeof f.opacity === 'number' ? f.opacity : 1,
-      };
-      if (f.color) cf.color = rgbaToHex(f.color);
-      if (typeof f.imageRef === 'string') cf.imageRef = f.imageRef;
-      if (typeof f.imageHash === 'string') cf.imageHash = f.imageHash;
-      if (f.scaleMode) cf.scaleMode = f.scaleMode;
-      if (f.gradientStops) {
-        cf.gradientStops = f.gradientStops.map((s) => {
-          const cs = { position: s.position };
-          if (s.color) cs.color = rgbaToHex(s.color);
-          return cs;
-        });
-      }
-      if (f.gradientTransform) {
-        // 2D 矩阵，转成普通数组
-        try { cf.gradientTransform = JSON.parse(JSON.stringify(f.gradientTransform)); } catch (e) {}
-      }
-      return cf;
-    });
+  if (options.includeFills && Array.isArray(node.fills) && node.fills.length > 0) {
+    out.fills = node.fills.map(simplifyPaintForRead);
     out.hasImageFill = node.fills.some(
       (f) => f.type === 'IMAGE' && (f.imageRef || f.imageHash)
     );
+  } else if (options.includeFills && node.fills === figma.mixed) out.fills = "MIXED";
+
+  if (options.includeFills && Array.isArray(node.strokes) && node.strokes.length > 0) {
+    out.strokes = node.strokes.map(simplifyPaintForRead);
+  } else if (options.includeFills && node.strokes === figma.mixed) out.strokes = "MIXED";
+  if (options.includeFills && Array.isArray(node.backgrounds) && node.backgrounds.length > 0) {
+    out.backgrounds = node.backgrounds.map(simplifyPaintForRead);
   }
 
-  if (options.includeFills && node.strokes && Array.isArray(node.strokes) && node.strokes.length > 0) {
-    out.strokes = node.strokes.map((s) => {
-      const cs = {
-        type: s.type,
-        visible: s.visible !== false,
-        opacity: typeof s.opacity === 'number' ? s.opacity : 1,
-      };
-      if (s.color) cs.color = rgbaToHex(s.color);
-      return cs;
-    });
-  }
-
-  if (typeof node.cornerRadius === 'number') out.cornerRadius = node.cornerRadius;
+  if ("x" in node && typeof node.x === "number") out.x = node.x;
+  if ("y" in node && typeof node.y === "number") out.y = node.y;
+  if ("rotation" in node && typeof node.rotation === "number" && node.rotation !== 0) out.rotation = node.rotation;
+  if ("relativeTransform" in node) out.relativeTransform = toPlainValue(node.relativeTransform);
+  if ("absoluteTransform" in node) out.absoluteTransform = toPlainValue(node.absoluteTransform);
   if (node.absoluteBoundingBox) {
     out.absoluteBoundingBox = {
       x: node.absoluteBoundingBox.x,
@@ -612,18 +611,58 @@ function readNodeFull(node, options = {}, depth = 0) {
       height: node.absoluteBoundingBox.height,
     };
   }
+  if (node.absoluteRenderBounds) out.absoluteRenderBounds = toPlainValue(node.absoluteRenderBounds);
   if (typeof node.width === 'number') out.width = node.width;
   if (typeof node.height === 'number') out.height = node.height;
-  if (options.includeText && typeof node.characters === 'string') out.characters = node.characters;
-  if (options.includeText && node.style) {
-    out.style = {};
-    if (typeof node.style.fontFamily === 'string') out.style.fontFamily = node.style.fontFamily;
-    if (typeof node.style.fontStyle === 'string') out.style.fontStyle = node.style.fontStyle;
-    if (typeof node.style.fontWeight === 'number') out.style.fontWeight = node.style.fontWeight;
-    if (typeof node.style.fontSize === 'number') out.style.fontSize = node.style.fontSize;
+  if (typeof node.minWidth === "number") out.minWidth = node.minWidth;
+  if (typeof node.maxWidth === "number") out.maxWidth = node.maxWidth;
+  if (typeof node.minHeight === "number") out.minHeight = node.minHeight;
+  if (typeof node.maxHeight === "number") out.maxHeight = node.maxHeight;
+
+  if (typeof node.cornerRadius === 'number') out.cornerRadius = node.cornerRadius;
+  else if (node.cornerRadius === figma.mixed) out.cornerRadius = "MIXED";
+  for (const key of ["topLeftRadius", "topRightRadius", "bottomRightRadius", "bottomLeftRadius"]) {
+    if (typeof node[key] === "number") out[key] = node[key];
   }
 
-  // 资产识别关键字段
+  if (options.includeText && typeof node.characters === 'string') {
+    out.characters = node.characters;
+    out.text = {
+      characters: node.characters,
+      fontName: readMixedValue(node.fontName),
+      fontSize: readMixedValue(node.fontSize),
+      fontWeight: readMixedValue(node.fontWeight),
+      lineHeight: readMixedValue(node.lineHeight),
+      letterSpacing: readMixedValue(node.letterSpacing),
+      textAlignHorizontal: node.textAlignHorizontal,
+      textAlignVertical: node.textAlignVertical,
+      textAutoResize: node.textAutoResize,
+      textCase: readMixedValue(node.textCase),
+      textDecoration: readMixedValue(node.textDecoration),
+      paragraphIndent: node.paragraphIndent,
+      paragraphSpacing: node.paragraphSpacing,
+      listSpacing: node.listSpacing,
+      hangingPunctuation: node.hangingPunctuation,
+      hangingList: node.hangingList,
+      textTruncation: node.textTruncation,
+      maxLines: node.maxLines,
+    };
+    if (options.includeTextSegments && typeof node.getStyledTextSegments === "function") {
+      try {
+        out.text.segments = node.getStyledTextSegments([
+          "fontName", "fontSize", "fontWeight", "textDecoration", "textCase",
+          "fills", "lineHeight", "letterSpacing",
+        ]).map((segment) => {
+          const plain = toPlainValue(segment);
+          if (Array.isArray(segment.fills)) plain.fills = segment.fills.map(simplifyPaintForRead);
+          return plain;
+        });
+      } catch (error) {
+        out.text.segmentsUnavailable = true;
+      }
+    }
+  }
+
   if (Array.isArray(node.exportSettings) && node.exportSettings.length > 0) {
     out.exportSettings = node.exportSettings.map((s) => {
       const cs = {};
@@ -636,19 +675,87 @@ function readNodeFull(node, options = {}, depth = 0) {
       return cs;
     });
   }
+  out.exportable = "exportAsync" in node;
+  if (typeof node.isAsset === "boolean") out.isAsset = node.isAsset;
+
+  if (options.includeEffects && Array.isArray(node.effects) && node.effects.length > 0) {
+    out.effects = node.effects.map(simplifyEffectForRead);
+  } else if (options.includeEffects && node.effects === figma.mixed) out.effects = "MIXED";
+  if (typeof node.strokeWeight === "number") out.strokeWeight = node.strokeWeight;
+  if (typeof node.strokeTopWeight === "number") out.strokeTopWeight = node.strokeTopWeight;
+  if (typeof node.strokeRightWeight === "number") out.strokeRightWeight = node.strokeRightWeight;
+  if (typeof node.strokeBottomWeight === "number") out.strokeBottomWeight = node.strokeBottomWeight;
+  if (typeof node.strokeLeftWeight === "number") out.strokeLeftWeight = node.strokeLeftWeight;
+  if (node.strokeAlign) out.strokeAlign = node.strokeAlign;
+  if (Array.isArray(node.dashPattern) && node.dashPattern.length > 0) out.dashPattern = [...node.dashPattern];
+  if (typeof node.opacity === 'number') out.opacity = node.opacity;
+  if (node.blendMode && node.blendMode !== "PASS_THROUGH") out.blendMode = node.blendMode;
+  if (node.isMask === true) out.isMask = true;
+  if (node.maskType) out.maskType = node.maskType;
+  if (node.clipsContent === true) out.clipsContent = true;
+  if (Array.isArray(node.layoutGrids) && node.layoutGrids.length > 0) {
+    out.layoutGrids = node.layoutGrids.map((grid) => {
+      const plain = toPlainValue(grid);
+      if (grid.color) plain.color = rgbaToHex(grid.color);
+      return plain;
+    });
+  }
+  for (const key of ["arcData", "pointCount", "innerRadius", "handleMirroring"]) {
+    if (node[key] !== undefined) out[key] = toPlainValue(node[key]);
+  }
+
   if (typeof node.layoutMode === 'string' && node.layoutMode !== 'NONE') {
     out.layoutMode = node.layoutMode;
   }
+  for (const key of [
+    "layoutWrap", "primaryAxisAlignItems", "counterAxisAlignItems", "counterAxisAlignContent",
+    "layoutSizingHorizontal", "layoutSizingVertical", "primaryAxisSizingMode", "counterAxisSizingMode",
+    "layoutAlign", "constraints", "overflowDirection", "scrollBehavior", "overlayPositionType",
+    "overlayBackgroundInteraction", "itemReverseZIndex", "strokesIncludedInLayout",
+  ]) {
+    if (node[key] !== undefined) out[key] = toPlainValue(node[key]);
+  }
+  if (typeof node.layoutGrow === "number") out.layoutGrow = node.layoutGrow;
   if (typeof node.itemSpacing === 'number') out.itemSpacing = node.itemSpacing;
+  if (typeof node.counterAxisSpacing === "number") out.counterAxisSpacing = node.counterAxisSpacing;
   if (typeof node.paddingLeft === 'number') out.paddingLeft = node.paddingLeft;
   if (typeof node.paddingRight === 'number') out.paddingRight = node.paddingRight;
   if (typeof node.paddingTop === 'number') out.paddingTop = node.paddingTop;
   if (typeof node.paddingBottom === 'number') out.paddingBottom = node.paddingBottom;
-  if (typeof node.opacity === 'number' && node.opacity !== 1) out.opacity = node.opacity;
-  if (node.visible === false) out.visible = false;
   if (node.locked === true) out.locked = true;
 
-  // 子节点递归（保留所有类型，包括 VECTOR）
+  for (const key of ["fillStyleId", "strokeStyleId", "textStyleId", "effectStyleId", "gridStyleId"]) {
+    const value = readMixedValue(node[key]);
+    if (value !== undefined && value !== "") out[key] = value;
+  }
+  if (node.boundVariables) out.boundVariables = toPlainValue(node.boundVariables);
+  if (node.explicitVariableModes) out.explicitVariableModes = toPlainValue(node.explicitVariableModes);
+  if (node.resolvedVariableModes) out.resolvedVariableModes = toPlainValue(node.resolvedVariableModes);
+
+  if (options.includeComponentMetadata) {
+    if (typeof node.key === "string" && node.key) out.key = node.key;
+    if (typeof node.description === "string" && node.description) out.description = node.description;
+    if (node.componentProperties) out.componentProperties = toPlainValue(node.componentProperties);
+    if (node.componentPropertyDefinitions) out.componentPropertyDefinitions = toPlainValue(node.componentPropertyDefinitions);
+    if (node.componentPropertyReferences) out.componentPropertyReferences = toPlainValue(node.componentPropertyReferences);
+    if (node.variantProperties) out.variantProperties = toPlainValue(node.variantProperties);
+    try {
+      const mainComponent = node.mainComponent;
+      if (mainComponent) {
+        out.mainComponent = {
+          id: mainComponent.id,
+          name: mainComponent.name,
+          key: mainComponent.key,
+        };
+      }
+    } catch (error) {
+      out.mainComponentUnavailable = true;
+    }
+  }
+  if (options.includeReactions && Array.isArray(node.reactions) && node.reactions.length > 0) {
+    out.reactions = toPlainValue(node.reactions);
+  }
+
   if (options.includeChildren && depth < options.maxDepth && node.children) {
     out.children = node.children
       .map((c) => readNodeFull(c, options, depth + 1))
@@ -660,6 +767,277 @@ function readNodeFull(node, options = {}, depth = 0) {
   }
 
   return out;
+}
+
+async function resolveReadScope(params = {}) {
+  const scope = params.scope || "current_page";
+  const requestedPageIds = Array.isArray(params.pageIds) ? new Set(params.pageIds) : null;
+
+  if (scope === "all_pages" || requestedPageIds) {
+    await figma.loadAllPagesAsync();
+  } else {
+    await figma.currentPage.loadAsync();
+  }
+
+  if (scope === "selection") {
+    return [{
+      page: figma.currentPage,
+      roots: figma.currentPage.selection.filter((node) => isEffectivelyVisible(node)),
+    }];
+  }
+
+  const pages = scope === "all_pages" || requestedPageIds
+    ? figma.root.children.filter((page) => !requestedPageIds || requestedPageIds.has(page.id))
+    : [figma.currentPage];
+
+  return pages.map((page) => ({
+    page,
+    roots: page.children.filter((node) => isEffectivelyVisible(node)),
+  }));
+}
+
+function incrementCount(map, key) {
+  map.set(key, (map.get(key) || 0) + 1);
+}
+
+function countPaintColors(paints, colorCounts) {
+  if (!Array.isArray(paints)) return;
+  for (const paint of paints) {
+    if (paint.visible === false) continue;
+    if (paint.color) incrementCount(colorCounts, paint.color);
+    if (Array.isArray(paint.gradientStops)) {
+      for (const stop of paint.gradientStops) {
+        if (stop.color) incrementCount(colorCounts, stop.color);
+      }
+    }
+  }
+}
+
+function classifySerializedAsset(node, isTopLevel) {
+  const reasons = [];
+  const vectorTypes = new Set(["VECTOR", "BOOLEAN_OPERATION", "STAR", "POLYGON", "LINE"]);
+  const mediaTypes = new Set(["MEDIA", "EMBED", "LINK_UNFURL"]);
+  const hasConfiguredExport = Array.isArray(node.exportSettings) && node.exportSettings.length > 0;
+
+  if (isTopLevel && ["FRAME", "SLIDE"].includes(node.type)) reasons.push("top_level_screen");
+  if (node.isAsset === true) reasons.push("figma_is_asset");
+  if (node.hasImageFill === true) reasons.push("image_fill");
+  if (hasConfiguredExport) reasons.push("export_settings");
+  if (node.type === "SLICE") reasons.push("slice");
+  if (vectorTypes.has(node.type)) reasons.push("vector");
+  if (mediaTypes.has(node.type)) reasons.push("media");
+  if (reasons.length === 0 || node.exportable !== true) return null;
+
+  let kind = "asset";
+  if (reasons.includes("top_level_screen")) kind = "screen";
+  else if (reasons.includes("image_fill")) kind = "image";
+  else if (reasons.includes("media")) kind = "media";
+  else if (reasons.includes("vector") || (node.isAsset === true && !node.hasImageFill)) kind = "vector";
+  else if (reasons.includes("slice")) kind = "slice";
+  else if (reasons.includes("export_settings")) kind = "configured";
+
+  const configuredFormat = hasConfiguredExport && node.exportSettings[0].format;
+  const suggestedFormat = configuredFormat === "SVG" || (kind === "vector" && !node.hasImageFill)
+    ? "SVG"
+    : configuredFormat === "JPG" ? "JPG" : "PNG";
+
+  return { kind, reasons, suggestedFormat };
+}
+
+function buildDesignSummary(pages) {
+  const stats = {
+    pageCount: pages.length,
+    nodeCount: 0,
+    textNodeCount: 0,
+    componentCount: 0,
+    instanceCount: 0,
+    assetCount: 0,
+    screenCount: 0,
+    typeCounts: {},
+  };
+  const typeCounts = new Map();
+  const colorCounts = new Map();
+  const typographyCounts = new Map();
+  const spacingCounts = new Map();
+  const radiusCounts = new Map();
+  const assets = [];
+
+  function visit(node, page, path, isTopLevel) {
+    stats.nodeCount += 1;
+    incrementCount(typeCounts, node.type);
+    if (node.type === "TEXT") stats.textNodeCount += 1;
+    if (node.type === "COMPONENT" || node.type === "COMPONENT_SET") stats.componentCount += 1;
+    if (node.type === "INSTANCE") stats.instanceCount += 1;
+
+    countPaintColors(node.fills, colorCounts);
+    countPaintColors(node.strokes, colorCounts);
+    if (Array.isArray(node.effects)) {
+      for (const effect of node.effects) {
+        if (effect.visible !== false && effect.color) incrementCount(colorCounts, effect.color);
+      }
+    }
+
+    if (node.text) {
+      const fontName = node.text.fontName;
+      const family = fontName && typeof fontName === "object" ? fontName.family : fontName;
+      const style = fontName && typeof fontName === "object" ? fontName.style : undefined;
+      const typographyKey = JSON.stringify({
+        family,
+        style,
+        weight: node.text.fontWeight,
+        size: node.text.fontSize,
+        lineHeight: node.text.lineHeight,
+        letterSpacing: node.text.letterSpacing,
+      });
+      incrementCount(typographyCounts, typographyKey);
+      if (Array.isArray(node.text.segments)) {
+        for (const segment of node.text.segments) {
+          countPaintColors(segment.fills, colorCounts);
+          const segmentFont = segment.fontName;
+          const segmentTypographyKey = JSON.stringify({
+            family: segmentFont && typeof segmentFont === "object" ? segmentFont.family : segmentFont,
+            style: segmentFont && typeof segmentFont === "object" ? segmentFont.style : undefined,
+            weight: segment.fontWeight,
+            size: segment.fontSize,
+            lineHeight: segment.lineHeight,
+            letterSpacing: segment.letterSpacing,
+          });
+          incrementCount(typographyCounts, segmentTypographyKey);
+        }
+      }
+    }
+
+    for (const key of ["itemSpacing", "counterAxisSpacing", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft"]) {
+      if (typeof node[key] === "number") incrementCount(spacingCounts, String(node[key]));
+    }
+    if (typeof node.cornerRadius === "number") incrementCount(radiusCounts, String(node.cornerRadius));
+    for (const key of ["topLeftRadius", "topRightRadius", "bottomRightRadius", "bottomLeftRadius"]) {
+      if (typeof node[key] === "number") incrementCount(radiusCounts, String(node[key]));
+    }
+
+    const asset = classifySerializedAsset(node, isTopLevel);
+    if (asset) {
+      assets.push({
+        id: node.id,
+        name: node.name,
+        type: node.type,
+        pageId: page.id,
+        pageName: page.name,
+        path: [...path, node.name].join(" / "),
+        width: node.width,
+        height: node.height,
+        exportable: true,
+        ...asset,
+      });
+      if (asset.kind === "screen") stats.screenCount += 1;
+    }
+
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) visit(child, page, [...path, node.name], false);
+    }
+  }
+
+  for (const page of pages) {
+    for (const node of page.nodes) visit(node, page, [page.name], true);
+  }
+
+  stats.assetCount = assets.length;
+  stats.typeCounts = Object.fromEntries([...typeCounts.entries()].sort((a, b) => a[0].localeCompare(b[0])));
+  const countedValues = (map, parser = (value) => value) => [...map.entries()]
+    .map(([value, count]) => ({ value: parser(value), count }))
+    .sort((a, b) => b.count - a.count || String(a.value).localeCompare(String(b.value)));
+
+  return {
+    stats,
+    assets,
+    tokens: {
+      colors: countedValues(colorCounts),
+      typography: countedValues(typographyCounts, (value) => JSON.parse(value)),
+      spacing: countedValues(spacingCounts, Number),
+      radii: countedValues(radiusCounts, Number),
+    },
+  };
+}
+
+async function getDesignContext(params = {}) {
+  const readOptions = normalizeReadOptions({
+    ...(params.options || {}),
+    includeChildren: true,
+  });
+  const scopedPages = await resolveReadScope(params);
+  const pages = scopedPages.map(({ page, roots }) => ({
+    id: page.id,
+    name: page.name,
+    nodes: roots
+      .map((node) => readNodeFull(node, readOptions))
+      .filter((node) => node !== null),
+  }));
+  const summary = buildDesignSummary(pages);
+
+  return JSON.parse(JSON.stringify({
+    file: {
+      id: figma.root.id,
+      name: figma.root.name,
+      editorType: figma.editorType,
+      currentPageId: figma.currentPage.id,
+    },
+    scope: params.scope || "current_page",
+    hiddenNodesExcluded: true,
+    traversal: {
+      allRequestedPagesLoaded: params.scope === "all_pages" || Array.isArray(params.pageIds),
+      unlimitedDepth: !Number.isFinite(readOptions.maxDepth),
+      maxDepth: Number.isFinite(readOptions.maxDepth) ? readOptions.maxDepth : null,
+    },
+    ...summary,
+    pages,
+  }));
+}
+
+async function listDesignAssets(params = {}) {
+  const context = await getDesignContext({
+    ...params,
+    scope: params.scope || "all_pages",
+    options: {
+      ...(params.options || {}),
+      includeTextSegments: false,
+      includeReactions: false,
+    },
+  });
+  const requestedKinds = Array.isArray(params.kinds) ? new Set(params.kinds) : null;
+  const assets = requestedKinds
+    ? context.assets.filter((asset) => requestedKinds.has(asset.kind))
+    : context.assets;
+
+  return {
+    file: context.file,
+    scope: context.scope,
+    hiddenNodesExcluded: true,
+    pageCount: context.stats.pageCount,
+    assetCount: assets.length,
+    assets,
+  };
+}
+
+async function getNodeCss(params = {}) {
+  const nodeIds = Array.isArray(params.nodeIds) ? params.nodeIds : [];
+  const results = [];
+  for (const nodeId of nodeIds) {
+    const node = await figma.getNodeByIdAsync(nodeId);
+    if (!node || !isEffectivelyVisible(node)) {
+      results.push({ nodeId, error: "Node not found or hidden" });
+      continue;
+    }
+    if (typeof node.getCSSAsync !== "function") {
+      results.push({ nodeId, name: node.name, type: node.type, error: "CSS is unavailable for this node/editor" });
+      continue;
+    }
+    try {
+      results.push({ nodeId, name: node.name, type: node.type, css: await node.getCSSAsync() });
+    } catch (error) {
+      results.push({ nodeId, name: node.name, type: node.type, error: error.message || String(error) });
+    }
+  }
+  return { hiddenNodesExcluded: true, results };
 }
 
 async function getReactions(nodeIds) {
@@ -677,6 +1055,7 @@ async function getReactions(nodeIds) {
 
     // Function to find nodes with reactions from the node and all its children
     async function findNodesWithReactions(node, processedNodes = new Set(), depth = 0, results = []) {
+      if (!isEffectivelyVisible(node)) return results;
       // Skip already processed nodes (prevent circular references)
       if (processedNodes.has(node.id)) {
         return results;
@@ -1140,7 +1519,6 @@ async function setFillColor(params) {
   if (!node) {
     throw new Error(`Node not found with ID: ${nodeId}`);
   }
-
   if (!("fills" in node)) {
     throw new Error(`Node does not support fills: ${nodeId}`);
   }
@@ -1443,6 +1821,9 @@ async function exportNodeAsImage(params) {
   if (!node) {
     throw new Error(`Node not found with ID: ${nodeId}`);
   }
+  if (!isEffectivelyVisible(node)) {
+    throw new Error(`Hidden nodes are excluded from export: ${nodeId}`);
+  }
 
   if (!("exportAsync" in node)) {
     throw new Error(`Node does not support exporting: ${nodeId}`);
@@ -1644,6 +2025,8 @@ async function setTextContent(params) {
       settings: {
         serverPort: state.serverPort,
       },
+      fileName: figma.root.name,
+      fileKey: figma.fileKey || "",
     });
   } catch (error) {
     console.error("Error loading settings:", error);
@@ -2150,8 +2533,7 @@ async function collectNodesToProcess(
   depth = 0,
   nodesToProcess = []
 ) {
-  // Skip invisible nodes
-  if (node.visible === false) return;
+  if (!isEffectivelyVisible(node)) return;
 
   // Get the path to this node
   const nodePath = [...parentPath, node.name || `Unnamed ${node.type}`];
@@ -2242,8 +2624,7 @@ function delay(ms) {
 
 // Keep the original findTextNodes for backward compatibility
 async function findTextNodes(node, parentPath = [], depth = 0, textNodes = []) {
-  // Skip invisible nodes
-  if (node.visible === false) return;
+  if (!isEffectivelyVisible(node)) return;
 
   // Get the path to this node including its name
   const nodePath = [...parentPath, node.name || `Unnamed ${node.type}`];
@@ -2863,8 +3244,7 @@ async function scanNodesByTypes(params) {
  * @param {Array} matchingNodes - Array to store found nodes
  */
 async function findNodesByTypes(node, types, matchingNodes = []) {
-  // Skip invisible nodes
-  if (node.visible === false) return;
+  if (!isEffectivelyVisible(node)) return;
 
   // Check if this node is one of the specified types
   if (types.includes(node.type)) {
