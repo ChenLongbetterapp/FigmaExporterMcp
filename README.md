@@ -15,7 +15,7 @@ The first MCP server process owns the embedded relay on port `3066`. Additional 
 
 ## Local Paths
 
-- Repository: `D:\LongWorkspace\FigmaExporterMcp`
+- Paths below are relative to the repository root; each computer keeps its own checkout location.
 - MCP entry: `dist/server.js`
 - Server source: `src/server.ts`
 - Plugin manifest: `figma-plugin/manifest.json`
@@ -25,31 +25,44 @@ The first MCP server process owns the embedded relay on port `3066`. Additional 
 ## Install and Build
 
 ```powershell
-cd D:\LongWorkspace\FigmaExporterMcp
+cd <your-checkout>
 npm install
 npm run build
 ```
 
+## Install the Codex Skill
+
+The skill for this bridge lives in `skills/figma-exporter-mcp/` in this repository and is the source of truth. Codex discovers skills under `$CODEX_HOME/skills/<name>/`, so install or refresh it by copying that folder into the Codex home of the current computer:
+
+```powershell
+$repo = '<your-checkout>'
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+New-Item -ItemType Directory -Force -Path (Join-Path $codexHome 'skills') | Out-Null
+Copy-Item -Recurse -Force (Join-Path $repo 'skills\figma-exporter-mcp') (Join-Path $codexHome 'skills')
+```
+
+Restart Codex after installing or updating the skill. Operating rules are in `skills/figma-exporter-mcp/SKILL.md`; maintenance details are in `skills/figma-exporter-mcp/references/maintenance.md`.
+
 ## Codex Global MCP Config
 
-Add this to `C:\Users\chenlong\.codex\config.toml` and restart Codex:
+Add this to the Codex home config (`$CODEX_HOME/config.toml`; on Windows this defaults to `%USERPROFILE%\.codex\config.toml`) and restart Codex:
 
 ```toml
 [mcp_servers.figma_exporter_mcp]
 command = 'node'
-args = ['D:\LongWorkspace\FigmaExporterMcp\dist\server.js']
+args = ['<your-checkout>\dist\server.js']
 startup_timeout_sec = 120
 
 [mcp_servers.figma_exporter_mcp.env]
 FIGMA_EXPORTER_RELAY_PORT = '3066'
-FIGMA_EXPORTER_EXPORT_DIR = 'D:\LongWorkspace\FigmaExporterMcp\exports'
+FIGMA_EXPORTER_EXPORT_DIR = '<your-checkout>\exports'
 ```
 
 ## Install the Figma Plugin
 
 1. Open Figma.
 2. Go to Plugins -> Development -> Import plugin from manifest.
-3. Select `D:\LongWorkspace\FigmaExporterMcp\figma-plugin\manifest.json`.
+3. Select `figma-plugin/manifest.json` inside your checkout.
 4. Run the plugin in the Figma file you want Codex to access.
 5. The plugin auto-connects to `ws://localhost:3066`.
 
@@ -102,5 +115,5 @@ The traversal/export behavior follows the official Figma Plugin API documentatio
 | Variable | Default | Description |
 |---|---|---|
 | `FIGMA_EXPORTER_RELAY_PORT` | `3066` | WebSocket/HTTP relay port |
-| `FIGMA_EXPORTER_EXPORT_DIR` | `D:\LongWorkspace\FigmaExporterMcp\exports` in Codex config | Local image export directory |
+| `FIGMA_EXPORTER_EXPORT_DIR` | `<working-directory>/exports` | Local image export directory |
 | `FIGMA_EXPORTER_SESSION_ID` | auto-generated per MCP process | Optional stable session id for active-file routing |
