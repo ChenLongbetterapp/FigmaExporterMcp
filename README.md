@@ -1,119 +1,44 @@
 # FigmaExporterMcp
 
-FigmaExporterMcp is a local bridge that lets Codex and other MCP clients inspect, export, and modify Figma files through a development Figma plugin.
+通过本地开发插件读取、导出和修改当前打开的 Figma 设计文件。链路为 MCP stdio → 本机 relay → Figma 插件 UI → Plugin API；不使用 Figma REST Token。
 
-## Architecture
+代码入口为 `src/server.ts`。共注册 **69 个工具**：16 个内容读取、49 个设计操作、2 个资源导出和2个文件路由工具；另有6个策略提示。
 
-```text
-Codex / MCP client <--stdio--> MCP Server <--WebSocket :3066--> Figma Plugin
-                                  ^
-                                  |
-                     other Codex sessions proxy by HTTP
+## 本机使用
+
+全局 Skill、客户端脚本和运行副本统一维护于 `/Users/dp1_dev2/Documents/Skills/figma-exporter-mcp/`，发现入口为 `~/.codex/skills/figma-exporter-mcp`。业务仓库不保存 Skill 副本。
+
+```bash
+/Users/dp1_dev2/Documents/Skills/figma-exporter-mcp/scripts/run.sh start
+/Users/dp1_dev2/Documents/Skills/figma-exporter-mcp/scripts/run.sh status
+/Users/dp1_dev2/Documents/Skills/figma-exporter-mcp/scripts/run.sh call get_document_info --file '<status 返回的 channel>' --save document-index
 ```
 
-The first MCP server process owns the embedded relay on port `3066`. Additional Codex sessions start normally, detect the occupied port, and proxy commands to the relay owner. This allows multiple Codex sessions to share one Figma plugin connection without port conflicts.
+Figma 中导入全局运行副本的 `scripts/runtime/figma-plugin/manifest.json`，在目标文件运行 FigmaExporter。默认连接 `ws://localhost:3066`。文件名、连接通道用于发现目标；`fileKey` 为空是 Plugin API 权限边界，不能仅据此判断未连接，也不能声称已验证某个 URL 的 file key。
 
-## Local Paths
+`call` 通过真正的 MCP 工具执行并校验参数。设计写入另需 `--write`；此标志表示调用者已核对用户要求的范围，不代替用户授权。调用完成后读取真实节点验证结果；批量操作不提供事务回滚。
 
-- Paths below are relative to the repository root; each computer keeps its own checkout location.
-- MCP entry: `dist/server.js`
-- Server source: `src/server.ts`
-- Plugin manifest: `figma-plugin/manifest.json`
-- Plugin code: `figma-plugin/code.js`
-- Plugin UI: `figma-plugin/ui.html`
+## 开发
 
-## Install and Build
+Node.js 22 或更新版本；本机运行时在 `/Users/dp1_dev2/Documents/Skills/.runtime/node/bin/`。依赖的实际目录在全局 Skill 的 `cache/build/node_modules`，本仓库 `node_modules` 为忽略的符号链接。
 
-```powershell
-cd <your-checkout>
-npm install
-npm run build
+依赖安装与链接按 [本机维护](docs/maintenance.md) 执行，包缓存和依赖不落在业务项目。链接准备好后：
+
+```bash
+export PATH=/Users/dp1_dev2/Documents/Skills/.runtime/node/bin:$PATH
+npm run typecheck
+npm test
 ```
 
-## Install the Codex Skill
+`npm test` 先构建再运行测试。构建使用 esbuild 和 TypeScript，输出 `dist/`；生成文件随代码维护。用 esbuild 独立执行器替代 tsup/Rollup 后，构建无需在签名 Node 进程加载第三方原生扩展。测试的 WebSocket 插件为隔离替身，不会修改真实 Figma 文件。
 
-The skill for this bridge lives in `skills/figma-exporter-mcp/` in this repository and is the source of truth. Codex discovers skills under `$CODEX_HOME/skills/<name>/`, so install or refresh it by copying that folder into the Codex home of the current computer:
+更新本机全局运行副本见 [维护说明](docs/maintenance.md)。更新插件代码后需要在 Figma 停止并重跑插件；仅更新服务端时重启自己管理的 relay。不要终止其他程序或其他会话拥有的进程。
 
-```powershell
-$repo = '<your-checkout>'
-$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
-New-Item -ItemType Directory -Force -Path (Join-Path $codexHome 'skills') | Out-Null
-Copy-Item -Recurse -Force (Join-Path $repo 'skills\figma-exporter-mcp') (Join-Path $codexHome 'skills')
-```
+## 结构与行为
 
-Restart Codex after installing or updating the skill. Operating rules are in `skills/figma-exporter-mcp/SKILL.md`; maintenance details are in `skills/figma-exporter-mcp/references/maintenance.md`.
+- [架构与数据流](docs/architecture.md)：模块职责、会话路由、读取和写入调用链。
+- [工具能力](docs/tools.md)：能力分组、导出语义和操作限制。
+- [本机维护](docs/maintenance.md)：构建、运行副本、MCP 配置和诊断。
+- [Review 与验收](docs/validation.md)：问题修复、自动化检查、真实文件读写和清理的实际覆盖。
 
-## Codex Global MCP Config
-
-Add this to the Codex home config (`$CODEX_HOME/config.toml`; on Windows this defaults to `%USERPROFILE%\.codex\config.toml`) and restart Codex:
-
-```toml
-[mcp_servers.figma_exporter_mcp]
-command = 'node'
-args = ['<your-checkout>\dist\server.js']
-startup_timeout_sec = 120
-
-[mcp_servers.figma_exporter_mcp.env]
-FIGMA_EXPORTER_RELAY_PORT = '3066'
-FIGMA_EXPORTER_EXPORT_DIR = '<your-checkout>\exports'
-```
-
-## Install the Figma Plugin
-
-1. Open Figma.
-2. Go to Plugins -> Development -> Import plugin from manifest.
-3. Select `figma-plugin/manifest.json` inside your checkout.
-4. Run the plugin in the Figma file you want Codex to access.
-5. The plugin auto-connects to `ws://localhost:3066`.
-
-## Multi-Session Usage
-
-- Use `get_connected_files` to list connected Figma files.
-- Use `set_active_file` with a file name or channel keyword before mutating a design.
-- Active file selection is scoped per Codex session, so sessions do not overwrite each other's active target.
-- If a session logs `Proxy mode`, it is forwarding commands to the process that owns port `3066`; this is expected.
-- Some Figma contexts, especially team library files, may not expose `figma.fileKey` to the plugin. This is normal: the relay still treats the deterministic channel and file name as a connected file, and commands can be routed with `set_active_file`.
-- If the plugin UI says "Connected" but `get_connected_files` says no files, check `http://localhost:3066/channels`. A listed channel means the plugin is connected; restart Codex or rebuild/reload the MCP server if the MCP tool is using an older relay build.
-
-## Design Inspection and Export
-
-The read pipeline is visible-only by design. A node is excluded when either the node itself or any ancestor is hidden. Invisible branches inside component instances are skipped through Figma's native `skipInvisibleInstanceChildren` optimization.
-
-- `get_document_info` loads the document page index and returns every page plus its visible top-level layers.
-- `get_design_context` returns implementation-ready hierarchy data for `selection`, `current_page`, or `all_pages`. It includes geometry, auto-layout, constraints, fills, strokes, effects, text runs, component/instance metadata, bound variables, design-token summaries, screens, and recognized assets. Depth is unlimited unless `options.maxDepth` is supplied.
-- `get_node_css` returns Figma Inspect CSS for up to 100 visible nodes. Use it as a web implementation aid; the platform-neutral fields from `get_design_context` are the source for Compose.
-- `list_design_assets` scans all pages by default and recognizes Figma `isAsset` nodes, image fills, explicit export settings, slices, vector/media nodes, and top-level screen frames.
-- `export_design_assets` exports all recognized visible assets as PNG to `<export dir>/<file>/<platform>/<page>/`. Android is always 4x. Web uses 4x for tiny assets, 3x for small/medium assets, and normally 2x for larger UI, then reduces the scale only when needed to cap oversized output around 4096 px or 16 MP.
-- `export_node_as_image` remains available for a targeted export and now refuses hidden nodes.
-
-Typical implementation workflow:
-
-```text
-get_connected_files
-set_active_file (when more than one file is connected)
-get_document_info
-get_design_context(scope: "current_page" or "all_pages")
-get_node_css(nodeIds: [...])               # web only, when useful
-export_design_assets(scope: "all_pages", platform: "android" or "web")
-```
-
-After changing `figma-plugin/code.js`, stop and rerun the development plugin in Figma. After rebuilding `src/server.ts`, restart the Codex MCP process (and the relay owner on port `3066`) so the new tool schema is registered.
-
-The traversal/export behavior follows the official Figma Plugin API documentation for [`loadAllPagesAsync`](https://developers.figma.com/docs/plugins/api/figma/#loadallpagesasync), [`skipInvisibleInstanceChildren`](https://developers.figma.com/docs/plugins/api/properties/figma-skipinvisibleinstancechildren/), [`visible`](https://developers.figma.com/docs/plugins/api/properties/nodes-visible/), [`DocumentNode`](https://developers.figma.com/docs/plugins/api/DocumentNode/), and [`exportAsync`](https://developers.figma.com/docs/plugins/api/properties/nodes-exportasync/).
-
-## Development Notes
-
-- Modify `src/server.ts` for MCP tools, relay endpoints, proxy mode, and session routing.
-- Modify `figma-plugin/code.js` for Figma Plugin API command implementations.
-- Modify `figma-plugin/ui.html` for connection UI, reconnect behavior, and WebSocket messaging.
-- Run `npm run build` after server changes and commit the regenerated `dist/` files.
-- Run `npm test` to verify all-page traversal, unlimited nesting, inherited hidden-state filtering, token extraction, asset recognition, and hidden export rejection.
-- Keep `node_modules/`, `exports/`, logs, and `copilot_temp/` out of git.
-
-## Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `FIGMA_EXPORTER_RELAY_PORT` | `3066` | WebSocket/HTTP relay port |
-| `FIGMA_EXPORTER_EXPORT_DIR` | `<working-directory>/exports` | Local image export directory |
-| `FIGMA_EXPORTER_SESSION_ID` | auto-generated per MCP process | Optional stable session id for active-file routing |
+原仓库绑定具体 Windows 项目路径、节点 ID 的7个一次性脚本及旧 Skill 已保存至全局私有缓存 `upstream-legacy.tar.gz`，不再作为执行入口。

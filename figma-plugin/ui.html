@@ -383,6 +383,8 @@
         fileName: null,
         fileKey: null,
         pendingAutoConnect: false,
+        shouldReconnect: true,
+        reconnectTimer: null,
       };
 
       // UI Elements
@@ -439,7 +441,9 @@
       // Connect to WebSocket server
       async function connectToServer(port) {
         try {
-          if (state.connected && state.socket) {
+          state.shouldReconnect = true;
+          clearTimeout(state.reconnectTimer);
+          if (state.socket && state.socket.readyState <= WebSocket.OPEN) {
             updateConnectionStatus(true, "Already connected to server");
             return;
           }
@@ -447,13 +451,14 @@
           state.serverPort = port;
           const wsUrl = `ws://localhost:${port}`;
 
-          state.socket = new WebSocket(wsUrl);
+          const socket = new WebSocket(wsUrl);
+          state.socket = socket;
 
-          state.socket.onopen = () => {
+          socket.onopen = () => {
+            if (state.socket !== socket) { socket.close(); return; }
             // Use file-name-based channel if available, otherwise generate random
-            const channelName = state.fileName
-              ? sanitizeChannelName(state.fileName)
-              : generateChannelName();
+            // Keep this connection identity across reconnects, distinct even for same-name files.
+            const channelName = state.channel || `${sanitizeChannelName(state.fileName || "figma")}-${generateChannelName()}`;
             console.log("Joining channel:", channelName);
             state.channel = channelName;
 
@@ -468,7 +473,8 @@
             );
           };
 
-          state.socket.onmessage = (event) => {
+          socket.onmessage = (event) => {
+            if (state.socket !== socket) return;
             try {
               const data = JSON.parse(event.data);
               console.log("Received message:", data);
@@ -506,25 +512,23 @@
             }
           };
 
-          state.socket.onclose = () => {
+          socket.onclose = () => {
+            if (state.socket !== socket) return;
             state.connected = false;
             state.socket = null;
+            if (!state.shouldReconnect) {
+              updateConnectionStatus(false, "Disconnected from server");
+              return;
+            }
             updateConnectionStatus(false, "Disconnected from server. Reconnecting...");
-            // Auto-reconnect after 3 seconds
-            setTimeout(() => {
-              if (!state.connected) {
-                console.log("Auto-reconnecting...");
-                const port = parseInt(portInput.value, 10) || 3066;
-                connectToServer(port);
-              }
+            state.reconnectTimer = setTimeout(() => {
+              if (state.shouldReconnect && !state.socket) connectToServer(port);
             }, 3000);
           };
-
-          state.socket.onerror = (error) => {
+          socket.onerror = (error) => {
+            if (state.socket !== socket) return;
             console.error("WebSocket error:", error);
-            // Don't update status here — onclose will fire next and handle reconnect
-            state.connected = false;
-            state.socket = null;
+            // onclose owns cleanup and reconnect scheduling.
           };
         } catch (error) {
           console.error("Connection error:", error);
@@ -545,18 +549,19 @@
 
       // Disconnect from websocket server
       function disconnectFromServer() {
-        if (state.socket) {
-          state.socket.close();
-          state.socket = null;
-          state.connected = false;
-          updateConnectionStatus(false, "Disconnected from server");
-        }
+        state.shouldReconnect = false;
+        clearTimeout(state.reconnectTimer);
+        const socket = state.socket;
+        state.socket = null;
+        state.connected = false;
+        if (socket) socket.close();
+        updateConnectionStatus(false, "Disconnected from server");
       }
 
       // Handle messages from the WebSocket
       async function handleSocketMessage(payload) {
         const data = payload.message;
-        console.log("handleSocketMessage", data);
+        if (!data || typeof data !== "object") return;
 
         // If it's a response to a previous request
         if (data.id && state.pendingRequests.has(data.id)) {
@@ -834,7 +839,7 @@
             }
             break;
           case "auto-disconnect":
-            connectButton.click();
+            disconnectFromServer();
             break;
           case "command-result":
             // Forward the result from plugin code back to WebSocket
@@ -885,7 +890,7 @@
 
       // Auto-connect on plugin load (after file info is received)
       setTimeout(() => {
-        if (!state.connected) {
+        if (state.shouldReconnect && !state.socket) {
           console.log("Auto-connecting on plugin load...");
           const port = parseInt(portInput.value, 10) || 3066;
           connectToServer(port);

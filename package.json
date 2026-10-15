@@ -1,7 +1,7 @@
 {
   "name": "figma-exporter-mcp",
   "description": "FigmaExporter — MCP server + embedded Figma relay",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "module": "dist/server.js",
   "main": "dist/server.js",
   "bin": {
@@ -10,28 +10,30 @@
   "files": [
     "dist",
     "figma-plugin",
-    "*.mjs",
-    "README.md"
+    "README.md",
+    "docs"
   ],
   "type": "module",
   "scripts": {
     "start": "node dist/server.js",
-    "build": "tsup",
-    "build:watch": "tsup --watch",
-    "dev": "tsup --watch",
-    "test": "node tests/plugin-read.test.cjs && node tests/export-scale.test.cjs"
+    "build": "node scripts/build.mjs",
+    "test": "npm run build && node --test tests/*.test.cjs tests/*.test.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/uuid": "^10.0.0",
     "@types/ws": "^8.18.1",
-    "tsup": "^8.4.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "esbuild": "0.27.7"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.13.1",
-    "uuid": "latest",
-    "ws": "latest",
+    "uuid": "14.0.1",
+    "ws": "8.21.0",
     "zod": "3.22.4"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }
